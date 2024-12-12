@@ -21,6 +21,7 @@ __all__ = (
     "CBAM",
     "Concat",
     "RepConv",
+    "Efficient"
 )
 
 
@@ -31,7 +32,6 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
-
 
 class Conv(nn.Module):
     """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
@@ -52,6 +52,126 @@ class Conv(nn.Module):
     def forward_fuse(self, x):
         """Perform transposed convolution of 2D data."""
         return self.act(self.conv(x))
+
+
+from efficientblock import CNNBlock, InvertedResidualBlock
+
+base_model = [
+    # expand_ratio, channels, repeats, stride, kernel_size
+    [1, 16, 1, 1, 3],
+    [6, 24, 2, 2, 3],
+    [6, 40, 2, 2, 5],                  
+    [6, 80, 3, 2, 3],
+    [6, 112, 3, 1, 5],
+    [6, 192, 4, 2, 5],
+    [6, 320, 1, 1, 3],
+]
+
+class Efficient(nn.Module):
+    """Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)."""
+
+    default_act = nn.SiLU()  # default activation
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """Initialize Conv layer with given arguments including activation."""
+        super().__init__()
+        # self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        # self.bn = nn.BatchNorm2d(c2)
+        # self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+        alpha = 1.2
+        beta = 1.1
+        phi = 2
+        depth_factor = alpha**phi
+        width_factor = beta**phi
+        # channels = int(32 * width_factor) # 38
+        # out_channels = 4 * math.ceil(int(channels * width_factor) / 4) #48
+        last_channels = math.ceil(1280 * width_factor)
+        self.features = self.create_features(width_factor, depth_factor, last_channels)
+        self.head1 = nn.Sequential(
+            nn.Conv2d(-1, 256, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 32, kernel_size=3, stride=1, padding=1),
+        )
+        self.head2 = nn.Sequential(
+            nn.Conv2d(-1, 128, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
+        )
+        self.head3 = nn.Sequential(
+            nn.Conv2d(-1, 256, kernel_size=5, stride=1, padding=1),
+            nn.Conv2d(256, 128, kernel_size=5, stride=1, padding=1),
+            nn.Conv2d(128, 32, kernel_size=5, stride=1, padding=1),
+        )
+        self.head4 = nn.Sequential(
+            nn.Conv2d(-1, 128, kernel_size=5, stride=1, padding=1),
+            nn.Conv2d(128, 64, kernel_size=5, stride=1, padding=1),
+            nn.Conv2d(64, 32, kernel_size=5, stride=1, padding=1),
+        )
+        self.head5 = nn.Sequential(
+            nn.Conv2d(-1, 256, kernel_size=7, stride=1, padding=1),
+            nn.Conv2d(256, 128, kernel_size=7, stride=1, padding=1),
+            nn.Conv2d(128, 32, kernel_size=7, stride=1, padding=1),
+        )
+        self.head6 = nn.Sequential(
+            nn.Conv2d(-1, 128, kernel_size=7, stride=1, padding=1),
+            nn.Conv2d(128, 64, kernel_size=7, stride=1, padding=1),
+            nn.Conv2d(64, 32, kernel_size=7, stride=1, padding=1),
+        )
+        self.head7 = nn.Conv2d(-1, 32, kernel_size=1, stride=1, padding=0)
+            
+
+    def create_features(self, width_factor, depth_factor, last_channels):
+        channels = int(32 * width_factor)
+        features = [CNNBlock(3, channels, 3, stride=2, padding=1)]
+        in_channels = channels
+
+        for expand_ratio, channels, repeats, stride, kernel_size in base_model:
+            out_channels = 4 * math.ceil(int(channels * width_factor) / 4)
+            layers_repeats = math.ceil(repeats * depth_factor)
+
+            for layer in range(layers_repeats):
+                features.append(
+                    InvertedResidualBlock(
+                        in_channels,
+                        out_channels,
+                        expand_ratio=expand_ratio,
+                        stride=stride if layer == 0 else 1,
+                        kernel_size=kernel_size,
+                        padding=kernel_size // 2,  # if k=1:pad=0, k=3:pad=1, k=5:pad=2
+                    )
+                )
+                in_channels = out_channels
+
+        features.append(
+            CNNBlock(in_channels, last_channels, kernel_size=1, stride=1, padding=0)
+        )
+
+        return nn.Sequential(*features)
+
+    def forward(self, x):
+        """Apply convolution, batch normalization and activation to input tensor."""
+        # return self.act(self.bn(self.conv(x)))
+        out1 = self.head1(self.features(x))
+        out2 = self.head2(self.features(x))
+        out3 = self.head3(self.features(x))
+        out4 = self.head4(self.features(x))
+        out5 = self.head5(self.features(x))
+        out6 = self.head6(self.features(x))
+        out7 = self.head7(self.features(x))
+        return torch.cat([out1, out2, out3, out4, out5, out6, out7], dim=1)
+
+
+    def forward_fuse(self, x):
+        """Perform transposed convolution of 2D data."""
+        # return self.act(self.conv(x))
+        out1 = self.head1(self.features(x))
+        out2 = self.head2(self.features(x))
+        out3 = self.head3(self.features(x))
+        out4 = self.head4(self.features(x))
+        out5 = self.head5(self.features(x))
+        out6 = self.head6(self.features(x))
+        out7 = self.head7(self.features(x))
+        return torch.cat([out1, out2, out3, out4, out5, out6, out7], dim=1)
 
 
 class Conv2(Conv):
